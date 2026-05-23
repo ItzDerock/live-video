@@ -1,0 +1,17 @@
+[package]
+name = "raptorq-dec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "raptorq-dec"
+path = "src/main.rs"
+
+[dependencies]
+raptorq-ts-common = { path = "../common" }
+raptorq = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "raptorq-enc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "raptorq-enc"
+path = "src/main.rs"
+
+[dependencies]
+raptorq-ts-common = { path = "../common" }
+raptorq = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zmq = { workspace = true }
