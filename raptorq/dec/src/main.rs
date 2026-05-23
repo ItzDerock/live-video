@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use raptorq::{EncodingPacket, ObjectTransmissionInformation, SourceBlockDecoder};
 use raptorq_ts_common::{
-    parse_packet, ParsedFrame, DEFAULT_PID, SYMBOL_SIZE, TS_PACKET_SIZE, TS_SYNC_BYTE,
+    parse_packet, ParsedFrame, SYMBOL_SIZE, TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -19,7 +19,7 @@ use tracing::{debug, info, trace, warn};
              MPEG-TS stream using RaptorQ, and emits it in order on stdout."
 )]
 struct Args {
-    #[arg(long, value_parser = parse_pid, default_value_t = DEFAULT_PID)]
+    #[arg(long, value_parser = parse_pid, default_value = "0x100")]
     pid: u16,
 
     /// Number of in-flight blocks to keep state for.
@@ -29,6 +29,10 @@ struct Args {
     /// How long to wait before giving up on a block and emitting best-effort.
     #[arg(long, default_value_t = 700)]
     block_timeout_ms: u64,
+
+    /// Print link stats to stderr every N seconds (0 = off).
+    #[arg(long, default_value_t = 10)]
+    stats_interval_secs: u64,
 }
 
 fn parse_pid(s: &str) -> std::result::Result<u16, String> {
@@ -151,6 +155,48 @@ impl BlockState {
     }
 }
 
+#[derive(Default)]
+struct IntervalStats {
+    decoded: u64,
+    besteffort: u64,
+    be_timed_out: u64,
+    be_forced: u64,
+    /// sum of (src_rcvd + repair_rcvd) for best-effort blocks
+    be_syms_rcvd: u64,
+    /// sum of K for best-effort blocks
+    be_syms_needed: u64,
+    zero: u64,
+    pkts_ok: u64,
+    pkts_dropped: u64,
+}
+
+fn log_interval_stats(s: &IntervalStats, elapsed: f64) {
+    let be_fill_pct = if s.be_syms_needed > 0 {
+        s.be_syms_rcvd * 100 / s.be_syms_needed
+    } else {
+        100
+    };
+    let total_pkts = s.pkts_ok + s.pkts_dropped;
+    let drop_pct = if total_pkts > 0 {
+        s.pkts_dropped as f64 * 100.0 / total_pkts as f64
+    } else {
+        0.0
+    };
+    info!(
+        interval_s = format!("{elapsed:.1}"),
+        decoded = s.decoded,
+        best_effort = s.besteffort,
+        be_fill_pct,
+        be_timed_out = s.be_timed_out,
+        be_forced = s.be_forced,
+        zero_blocks = s.zero,
+        pkts_ok = s.pkts_ok,
+        pkts_dropped = s.pkts_dropped,
+        drop_pct = format!("{drop_pct:.2}"),
+        "link stats",
+    );
+}
+
 fn unwrap_sbn(cursor: u64, sbn_u8: u8) -> u64 {
     let cursor_low = (cursor & 0xFF) as u8;
     let diff = sbn_u8.wrapping_sub(cursor_low) as i8 as i64;
@@ -162,6 +208,8 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
     let max_in_flight = args.max_blocks_in_flight as u64;
     let pid = args.pid;
     let poll_tick = Duration::from_millis(20);
+    let stats_interval = (args.stats_interval_secs > 0)
+        .then(|| Duration::from_secs(args.stats_interval_secs));
 
     let mut pool: BTreeMap<u64, BlockState> = BTreeMap::new();
     let mut cursor: u64 = 0;
@@ -173,6 +221,9 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
     let mut besteffort_blocks = 0u64;
     let mut zero_blocks = 0u64;
     let mut dropped_packets = 0u64;
+
+    let mut istats = IntervalStats::default();
+    let mut last_stats = Instant::now();
 
     loop {
         match rx.recv_timeout(poll_tick) {
@@ -193,12 +244,14 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
                     };
                     if logical < cursor {
                         dropped_packets += 1;
+                        istats.pkts_dropped += 1;
                         trace!(logical, cursor, "stale packet dropped");
                         continue;
                     }
                     if logical > highest_seen {
                         highest_seen = logical;
                     }
+                    istats.pkts_ok += 1;
                     let entry = pool
                         .entry(logical)
                         .or_insert_with(|| BlockState::new(sbn_u8, &oti));
@@ -208,6 +261,7 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
                 Ok(ParsedFrame::Noop) => {}
                 Err(e) => {
                     dropped_packets += 1;
+                    istats.pkts_dropped += 1;
                     trace!(error = %e, "dropping unparseable packet");
                 }
             },
@@ -235,19 +289,34 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
                     let data = pool.remove(&cursor).unwrap().completed.unwrap();
                     stdout.write_all(&data).context("writing stdout")?;
                     decoded_blocks += 1;
+                    istats.decoded += 1;
                     debug!(sbn = cursor, "emitted decoded block");
                     cursor += 1;
                 }
                 Some(b) if b.first_seen.elapsed() >= timeout || should_force => {
+                    let timed_out = b.first_seen.elapsed() >= timeout;
                     let recovered = b.source_symbols.len();
                     let repair = b.repair_count;
+                    let k = b.k;
                     let data = b.best_effort();
                     pool.remove(&cursor);
                     stdout.write_all(&data).context("writing stdout")?;
                     besteffort_blocks += 1;
+                    istats.besteffort += 1;
+                    istats.be_syms_rcvd += recovered as u64 + repair as u64;
+                    istats.be_syms_needed += k as u64;
+                    if timed_out {
+                        istats.be_timed_out += 1;
+                    } else {
+                        istats.be_forced += 1;
+                    }
                     warn!(
                         sbn = cursor,
-                        recovered, repair, "best-effort emit (timeout)"
+                        recovered,
+                        repair,
+                        k,
+                        timed_out,
+                        "best-effort emit"
                     );
                     cursor += 1;
                 }
@@ -255,10 +324,20 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
                     let data = vec![0u8; raptorq_ts_common::DEFAULT_BLOCK_SIZE];
                     stdout.write_all(&data).context("writing stdout")?;
                     zero_blocks += 1;
+                    istats.zero += 1;
                     warn!(sbn = cursor, "emitting zero block (no symbols)");
                     cursor += 1;
                 }
                 _ => break,
+            }
+        }
+
+        if let Some(interval) = stats_interval {
+            let elapsed = last_stats.elapsed();
+            if elapsed >= interval {
+                log_interval_stats(&istats, elapsed.as_secs_f64());
+                istats = IntervalStats::default();
+                last_stats = Instant::now();
             }
         }
     }

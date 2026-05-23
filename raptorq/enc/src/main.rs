@@ -9,7 +9,7 @@ use clap::{Parser, ValueEnum};
 use raptorq::{EncodingPacket, ObjectTransmissionInformation, SourceBlockEncoder};
 use raptorq_ts_common::{
     build_data_packet, build_noop_packet, make_block_oti, ContinuityCounter, DEFAULT_BLOCK_SIZE,
-    DEFAULT_PID, DEFAULT_REPAIR_OVERHEAD, SYMBOL_SIZE, TS_PACKET_SIZE,
+    DEFAULT_REPAIR_OVERHEAD, SYMBOL_SIZE, TS_PACKET_SIZE,
 };
 use tracing::{debug, info, warn};
 
@@ -203,30 +203,13 @@ fn encoder_thread(
             repair = repair_pkts.len(),
             "block encoded"
         );
-        let mut src_it = source.into_iter();
-        let mut rep_it = repair_pkts.into_iter();
         let k_block = (block_size / SYMBOL_SIZE) as u32;
         let rep_interval = if repair > 0 {
             (k_block / repair).max(1)
         } else {
             u32::MAX
         };
-        let mut src_count = 0u32;
-        let interleaved = std::iter::from_fn(move || {
-            if repair > 0 && src_count > 0 && src_count % rep_interval == 0 {
-                if let Some(r) = rep_it.next() {
-                    return Some(r);
-                }
-            }
-            match src_it.next() {
-                Some(s) => {
-                    src_count += 1;
-                    Some(s)
-                }
-                None => rep_it.next(),
-            }
-        });
-        for p in interleaved {
+        for p in interleave(source, repair_pkts, rep_interval) {
             if out.send(p).is_err() {
                 warn!("writer dropped; encoder exiting");
                 return Ok(());
@@ -307,5 +290,128 @@ fn writer_thread(
             debug!(packets_sent, noops_sent, "writer heartbeat");
             last_log = Instant::now();
         }
+    }
+}
+
+/// Interleave source and repair packets so that one repair packet follows every
+/// `rep_interval` source packets.  Any leftover repairs are appended at the end.
+fn interleave(
+    source: Vec<EncodingPacket>,
+    repair: Vec<EncodingPacket>,
+    rep_interval: u32,
+) -> impl Iterator<Item = EncodingPacket> {
+    let mut src_it = source.into_iter();
+    let mut rep_it = repair.into_iter();
+    let mut src_count = 0u32;
+    let mut next_rep_after = rep_interval;
+    std::iter::from_fn(move || {
+        if src_count >= next_rep_after {
+            if let Some(r) = rep_it.next() {
+                next_rep_after += rep_interval;
+                return Some(r);
+            }
+        }
+        match src_it.next() {
+            Some(s) => {
+                src_count += 1;
+                Some(s)
+            }
+            None => rep_it.next(),
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raptorq::SourceBlockEncoder;
+    use raptorq_ts_common::{make_block_oti, DEFAULT_BLOCK_SIZE, DEFAULT_REPAIR_OVERHEAD, SYMBOL_SIZE};
+
+    fn make_packets(k: u32, repair: u32) -> (Vec<EncodingPacket>, Vec<EncodingPacket>) {
+        let block_size = k as usize * SYMBOL_SIZE;
+        let oti = make_block_oti(block_size as u64, SYMBOL_SIZE as u16);
+        let data: Vec<u8> = (0..block_size).map(|i| (i & 0xFF) as u8).collect();
+        let enc = SourceBlockEncoder::new(0, &oti, &data);
+        (enc.source_packets(), enc.repair_packets(0, repair))
+    }
+
+    #[test]
+    fn repair_packets_are_evenly_spaced() {
+        let k: u32 = 392;
+        let repair: u32 = 98;
+        let rep_interval = (k / repair).max(1);
+        let (source, repair_pkts) = make_packets(k, repair);
+
+        let out: Vec<EncodingPacket> = interleave(source, repair_pkts, rep_interval).collect();
+        assert_eq!(out.len(), (k + repair) as usize);
+
+        // Between any two consecutive repair packets there must be at least
+        // rep_interval - 1 source packets (i.e., no repair bursts).
+        let repair_positions: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.payload_id().encoding_symbol_id() >= k)
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(repair_positions.len(), repair as usize, "wrong repair count");
+        for window in repair_positions.windows(2) {
+            let gap = window[1] - window[0];
+            assert!(
+                gap >= rep_interval as usize,
+                "repair packets too close together: positions {} and {} (gap {}, need >= {})",
+                window[0], window[1], gap, rep_interval
+            );
+        }
+    }
+
+    #[test]
+    fn no_repair_passes_source_through_unchanged() {
+        let k: u32 = 8;
+        let (source, repair_pkts) = make_packets(k, 0);
+        assert!(repair_pkts.is_empty());
+        let out: Vec<EncodingPacket> = interleave(source.clone(), repair_pkts, u32::MAX).collect();
+        assert_eq!(out.len(), source.len());
+        for (a, b) in out.iter().zip(source.iter()) {
+            assert_eq!(a.payload_id().encoding_symbol_id(), b.payload_id().encoding_symbol_id());
+        }
+    }
+
+    #[test]
+    fn default_block_interleave_survives_burst_loss_of_repair_cluster() {
+        // With the old broken code all repairs were bunched after the 4th source
+        // packet; losing positions 4..102 wiped the entire repair budget.
+        // With the fix, a burst of that length only hits ~25 repairs, leaving
+        // enough to decode.
+        let k = (DEFAULT_BLOCK_SIZE / SYMBOL_SIZE) as u32;
+        let repair = (k as f32 * DEFAULT_REPAIR_OVERHEAD).ceil() as u32;
+        let rep_interval = (k / repair).max(1);
+        let (source, repair_pkts) = make_packets(k, repair);
+
+        let out: Vec<EncodingPacket> = interleave(source, repair_pkts, rep_interval).collect();
+
+        // Drop a burst of rep_interval * 2 packets starting at position 4
+        // (where the old code placed all repairs).
+        let burst_start = 4usize;
+        let burst_len = rep_interval as usize * 2;
+        let surviving: Vec<&EncodingPacket> = out
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i < burst_start || *i >= burst_start + burst_len)
+            .map(|(_, p)| p)
+            .collect();
+
+        let repairs_surviving = surviving
+            .iter()
+            .filter(|p| p.payload_id().encoding_symbol_id() >= k)
+            .count();
+
+        // After a burst of 2*rep_interval, we should lose at most 2 repair
+        // packets (one per rep_interval), leaving the vast majority intact.
+        assert!(
+            repairs_surviving >= (repair - 2) as usize,
+            "too many repairs lost in burst: {} surviving out of {repair}",
+            repairs_surviving
+        );
     }
 }
