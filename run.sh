@@ -8,12 +8,14 @@ FPS=30
 
 # ENCODER configuration
 ENCODER="${1:?Usage: $0 <mpp|vaapi|software>}"
-BPS=4000000
-GOP=60
-MUX_BITRATE=4900000
+BPS=2500000
+GOP=60 # send keyframes every 2 (60 [gop] / 30 fps) seconds.
+# Muxrate * 0.8
+MUX_BITRATE=2900000
 
 # OUTPUT configuration
-RAPTORQ_MUXRATE=6911765
+# Symbol rate * 2 (QPSK) * 3/4 (FEC rate) * 188/204 (RS overhead)
+RAPTORQ_MUXRATE=4147058
 ZMQ_SOCK="ipc:///run/user/1000/raptorq.sock"
 
 ### GST PIPELINE
