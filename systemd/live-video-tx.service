@@ -1,0 +1,16 @@
+[Unit]
+Description=Live Video Transmitter
+PartOf=live-video.target
+After=live-video.target
+
+[Service]
+Type=simple
+ExecStart=python3 /etc/live-video/gnuradio/dvbs_tx.py
+User=dietpi
+SupplementaryGroups=video
+RuntimeDirectory=live-video
+RuntimeDirectoryPreserve=yes
+Environment=SOCKET_PATH=/run/live-video/data.sock
+
+[Install]
+WantedBy=live-video.target

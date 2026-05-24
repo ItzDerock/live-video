@@ -1,0 +1,6 @@
+[Unit]
+Description=Live Video Link
+After=network.target
+
+[Install]
+WantedBy=multi-user.target

@@ -7,7 +7,7 @@ HEIGHT=720
 FPS=30
 
 # ENCODER configuration
-ENCODER="${1:?Usage: $0 <mpp|vaapi|software>}"
+ENCODER="${1:?Usage: $0 <mpp|vaapi|pi264|software>}"
 BPS=2500000
 GOP=60 # send keyframes every 2 (60 [gop] / 30 fps) seconds.
 # Muxrate * 0.8
@@ -39,8 +39,13 @@ case "$ENCODER" in
     GST_ENC="x265enc bitrate=$((BPS / 1000)) key-int-max=$GOP speed-preset=ultrafast tune=zerolatency \
       ! h265parse"
     ;;
+  pi264)
+    GST_ENC="v4l2h264enc extra-controls=\"encode,video_bitrate=$BPS,video_bitrate_mode=1,h264_i_frame_period=$GOP\" \
+        ! 'video/x-h264,level=(string)4' \
+        ! h264parse"
+    ;;
   *)
-    echo "Unknown encoder: $ENCODER (expected mpp, vaapi, or software)" >&2
+    echo "Unknown encoder: $ENCODER (expected mpp, vaapi, pi264, or software)" >&2
     exit 1
     ;;
 esac

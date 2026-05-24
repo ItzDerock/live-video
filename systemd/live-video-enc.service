@@ -1,0 +1,16 @@
+[Unit]
+Description=Live Video Encoder
+PartOf=live-video.target
+After=live-video.target
+
+[Service]
+Type=simple
+ExecStart=/etc/live-video/run.sh pi264
+User=dietpi
+SupplementaryGroups=video
+RuntimeDirectory=live-video
+RuntimeDirectoryPreserve=yes
+Environment=SOCKET_PATH=/run/live-video/data.sock
+
+[Install]
+WantedBy=live-video.target
