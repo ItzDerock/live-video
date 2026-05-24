@@ -42,7 +42,7 @@ case "$ENCODER" in
   pi264)
     GST_ENC="v4l2h264enc extra-controls=\"encode,video_bitrate=$BPS,video_bitrate_mode=1,h264_i_frame_period=$GOP\" \
         ! 'video/x-h264,level=(string)4' \
-        ! h264parse"
+        ! h264parse config-interval=-1"
     ;;
   *)
     echo "Unknown encoder: $ENCODER (expected mpp, vaapi, pi264, or software)" >&2
