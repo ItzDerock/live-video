@@ -38,19 +38,19 @@ class dvbs_tx(gr.top_block):
         self.symbol_rate = symbol_rate = 3000000
         self.samp_rate = samp_rate = symbol_rate * 2
         self.rrc_taps = rrc_taps = 100
-        self.center_freq = center_freq = int(2477e6)
+        self.center_freq = center_freq = int(2394e6)
 
         ##################################################
         # Blocks
         ##################################################
 
-        self.zeromq_pull_source_0 = zeromq.pull_source(gr.sizeof_char, 1, 'ipc:///run/user/1000/raptorq.sock', 100, False, (-1), False)
+        self.zeromq_pull_source_0 = zeromq.pull_source(gr.sizeof_char, 1, 'ipc:///run/live-video/raptorq.sock', 100, False, (-1), False)
         self.iio_pluto_sink_0_0 = iio.fmcomms2_sink_fc32('ip:pluto.local' if 'ip:pluto.local' else iio.get_pluto_uri(), [True, True], 1048576, False)
         self.iio_pluto_sink_0_0.set_len_tag_key('')
         self.iio_pluto_sink_0_0.set_bandwidth(20000000)
         self.iio_pluto_sink_0_0.set_frequency(center_freq)
         self.iio_pluto_sink_0_0.set_samplerate(samp_rate)
-        self.iio_pluto_sink_0_0.set_attenuation(0, 0)
+        self.iio_pluto_sink_0_0.set_attenuation(0, 14)
         self.iio_pluto_sink_0_0.set_filter_params('Auto', '', 0, 0)
         self.fft_filter_xxx_0 = filter.fft_filter_ccc(1, firdes.root_raised_cosine(1.0, samp_rate, samp_rate/2, 0.35, rrc_taps), 1)
         self.fft_filter_xxx_0.declare_sample_delay(0)
@@ -126,11 +126,14 @@ def main(top_block_cls=dvbs_tx, options=None):
     tb.start()
     tb.flowgraph_started.set()
 
-    try:
-        input('Press Enter to quit: ')
-    except EOFError:
-        pass
-    tb.stop()
+    # When attached to a terminal, quit on Enter. Under systemd there is no
+    # stdin, so block on the flowgraph instead and let SIGTERM stop it.
+    if sys.stdin is not None and sys.stdin.isatty():
+        try:
+            input('Press Enter to quit: ')
+        except EOFError:
+            pass
+        tb.stop()
     tb.wait()
 
 

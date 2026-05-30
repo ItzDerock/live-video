@@ -1,0 +1,23 @@
+---
+# Service account that owns files and runs the link.
+lv_user: livevideo
+lv_group: livevideo
+
+# Install root on the target.
+lv_root: /etc/live-video
+lv_bin: "{{ lv_root }}/bin"
+lv_runtime_dir: live-video # -> /run/live-video (systemd RuntimeDirectory)
+lv_socket: "ipc:///run/{{ lv_runtime_dir }}/raptorq.sock"
+
+# Hardware / network.
+eth_iface: eth0 # interface to disable EEE on
+ping_target: 10.60.70.2 # ground station; wait until reachable
+encoder: mpp # run.sh encoder mode
+
+# Rust toolchain (rustup) home for the service user.
+lv_home: "/home/{{ lv_user }}"
+cargo_bin: "{{ lv_home }}/.cargo/bin"
+
+# Set true to start the link immediately after provisioning. Default false so a
+# remote provisioning run does not surprise-restart a live transmitter.
+start_now: false

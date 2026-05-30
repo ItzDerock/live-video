@@ -1,1 +1,3 @@
 .direnv/
+ansible/.ansible
+ansible/inventory.ini

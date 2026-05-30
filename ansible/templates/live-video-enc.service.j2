@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Live Video Encoder (GStreamer -> RaptorQ)
+PartOf=live-video.target
+# Start after TX, but do not hard-require it: enc reconnects the socket on its
+# own, so the two services recover independently.
+Wants=live-video-tx.service
+After=live-video-tx.service
+# Retry forever: no start-rate limit -> no backoff, no cap.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart={{ lv_root }}/run.sh {{ encoder }}
+User={{ lv_user }}
+SupplementaryGroups=video input
+RuntimeDirectory={{ lv_runtime_dir }}
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=live-video.target

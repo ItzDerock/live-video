@@ -1,0 +1,209 @@
+---
+- name: Provision dvbraptor live-video SBC
+  hosts: sbc
+  become: true
+
+  vars:
+      # Repo root on the control machine (parent of this ansible/ dir).
+      repo_root: "{{ playbook_dir }}/.."
+
+  handlers:
+      - name: Reload systemd
+        ansible.builtin.systemd_service:
+            daemon_reload: true
+
+      - name: Reload udev
+        ansible.builtin.command:
+            cmd: "{{ item }}"
+        loop:
+            - udevadm control --reload
+            - udevadm trigger
+        changed_when: true
+
+  tasks:
+      # --- Packages -------------------------------------------------------------
+      - name: Install system packages
+        ansible.builtin.apt:
+            update_cache: true
+            name:
+                # build + runtime tooling
+                - acl # lets ansible hand off temp files when become_user=livevideo
+                - curl
+                - ffmpeg
+                - ethtool
+                - mbuffer
+                - coreutils
+                - build-essential
+                - pkg-config
+                - libzmq3-dev # links the `zmq` Rust crate
+                - iputils-ping
+                # python
+                - python3
+                - python3-zmq
+                # gstreamer (note: mpegtsmux lives in plugins-bad)
+                - gstreamer1.0-tools
+                - gstreamer1.0-plugins-base
+                - gstreamer1.0-plugins-good
+                - gstreamer1.0-plugins-bad
+                - gstreamer1.0-x
+                - gstreamer1.0-libav
+                # gnuradio + pluto (iio) support.
+                # `gnuradio` already Depends on libgnuradio-iio (the gr-iio
+                # blocks + python bindings used by dvbs_tx.py), so no separate
+                # iio package is needed.
+                - gnuradio
+                - gnuradio-dev
+                - libiio-utils
+            state: present
+
+      # --- Service user ---------------------------------------------------------
+      - name: Create livevideo group
+        ansible.builtin.group:
+            name: "{{ lv_group }}"
+            state: present
+
+      - name: Create livevideo user (input + video access)
+        ansible.builtin.user:
+            name: "{{ lv_user }}"
+            group: "{{ lv_group }}"
+            groups: [input, video]
+            append: true
+            shell: /bin/bash
+            create_home: true
+            home: "{{ lv_home }}"
+
+      # --- Rust toolchain (rustup, as livevideo) --------------------------------
+      - name: Download rustup installer
+        ansible.builtin.get_url:
+            url: https://sh.rustup.rs
+            dest: /tmp/rustup-init.sh
+            mode: "0755"
+            force: false
+
+      - name: Install rustup toolchain for livevideo
+        ansible.builtin.command:
+            cmd: /tmp/rustup-init.sh -y --profile minimal --no-modify-path
+            creates: "{{ cargo_bin }}/cargo"
+        become: true
+        become_user: "{{ lv_user }}"
+        environment:
+            HOME: "{{ lv_home }}"
+
+      # --- Install directories --------------------------------------------------
+      - name: Create install directories
+        ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: "{{ lv_user }}"
+            group: "{{ lv_group }}"
+            mode: "0755"
+        loop:
+            - "{{ lv_root }}"
+            - "{{ lv_bin }}"
+
+      # --- RaptorQ source + build ----------------------------------------------
+      - name: Sync raptorq source tree (excluding target/)
+        ansible.builtin.copy:
+            src: "{{ repo_root }}/raptorq/{{ item }}"
+            dest: "{{ lv_root }}/raptorq/"
+            owner: "{{ lv_user }}"
+            group: "{{ lv_group }}"
+            mode: preserve
+        loop:
+            - Cargo.toml
+            - Cargo.lock
+            - common
+            - dec
+            - enc
+        register: raptorq_src
+
+      - name: Check for built raptorq binaries
+        ansible.builtin.stat:
+            path: "{{ lv_root }}/raptorq/target/release/raptorq-enc"
+        register: raptorq_enc_bin
+
+      - name: Build raptorq (release) when source changed or not yet built
+        ansible.builtin.command:
+            cmd: "{{ cargo_bin }}/cargo build --release"
+            chdir: "{{ lv_root }}/raptorq"
+        become: true
+        become_user: "{{ lv_user }}"
+        environment:
+            HOME: "{{ lv_home }}"
+            PATH: "{{ cargo_bin }}:{{ ansible_env.PATH }}"
+        when: raptorq_src.changed or not raptorq_enc_bin.stat.exists
+        changed_when: true
+
+      - name: Install raptorq binaries into bin/
+        ansible.builtin.copy:
+            src: "{{ lv_root }}/raptorq/target/release/{{ item }}"
+            dest: "{{ lv_bin }}/{{ item }}"
+            remote_src: true
+            owner: "{{ lv_user }}"
+            group: "{{ lv_group }}"
+            mode: "0755"
+        loop:
+            - raptorq-enc
+            - raptorq-dec
+
+      # --- GNU Radio flowgraph --------------------------------------------------
+      - name: Sync gnuradio directory
+        ansible.builtin.copy:
+            src: "{{ repo_root }}/gnuradio/"
+            dest: "{{ lv_root }}/gnuradio/"
+            owner: "{{ lv_user }}"
+            group: "{{ lv_group }}"
+            mode: preserve
+
+      # --- run.sh ---------------------------------------------------------------
+      - name: Install run.sh
+        ansible.builtin.template:
+            src: run.sh.j2
+            dest: "{{ lv_root }}/run.sh"
+            owner: "{{ lv_user }}"
+            group: "{{ lv_group }}"
+            mode: "0755"
+
+      # --- udev rule ------------------------------------------------------------
+      - name: Install rocket-cam udev rule
+        ansible.builtin.copy:
+            src: 99-rocket-cam.rules
+            dest: /etc/udev/rules.d/99-rocket-cam.rules
+            owner: root
+            group: root
+            mode: "0644"
+        notify: Reload udev
+
+      # --- systemd units --------------------------------------------------------
+      - name: Install systemd units
+        ansible.builtin.template:
+            src: "{{ item }}.j2"
+            dest: "/etc/systemd/system/{{ item }}"
+            owner: root
+            group: root
+            mode: "0644"
+        loop:
+            - live-video-eee.service
+            - wait-network@.service
+            - live-video-tx.service
+            - live-video-enc.service
+            - live-video.target
+        notify: Reload systemd
+
+      - name: Flush handlers (reload systemd before enabling)
+        ansible.builtin.meta: flush_handlers
+
+      - name: Enable boot units
+        ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            enabled: true
+        loop:
+            - live-video-eee.service
+            - "wait-network@{{ ping_target }}.service"
+            - live-video.target
+
+      - name: Start the link now (optional)
+        ansible.builtin.systemd_service:
+            name: live-video.target
+            state: started
+        when: start_now | bool

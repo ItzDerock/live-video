@@ -1,0 +1,8 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Live Video Link
+Wants=live-video-eee.service wait-network@{{ ping_target }}.service live-video-tx.service live-video-enc.service
+After=network.target
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+# /etc/systemd/system/wait-network@.service
+[Unit]
+Description=Wait for %i to come online
+Wants=network.target live-video-eee.service
+After=network.target live-video-eee.service
+# Never give up: no start-rate limit caps how often this can (re)start.
+StartLimitIntervalSec=0
+
+[Service]
+# oneshot so dependents (the TX) block until %i actually answers. Type must stay
+# oneshot for that gating, and systemd ignores Restart= for oneshot -- so the
+# "never stop trying" guarantee lives entirely in the loop below: it only ever
+# exits 0 (on success), never fails out. No backoff, no attempt cap, no timeout.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'while true; do ping -c1 -W2 %i && break; sleep 2; done'
+TimeoutStartSec=infinity

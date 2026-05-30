@@ -1,0 +1,9 @@
+# /etc/systemd/system/wait-network@.service
+[Unit]
+Description=Wait for %i to come online
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Ping every 2s, up to 120 attempts (4 min timeout)
+ExecStart=/bin/bash -c 'while true; do ping -c1 -W1 %i && exit 0; sleep 2; done; exit 1'

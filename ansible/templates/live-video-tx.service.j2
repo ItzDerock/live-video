@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Live Video Transmitter (DVB-S flowgraph)
+PartOf=live-video.target
+Requires=wait-network@{{ ping_target }}.service
+After=wait-network@{{ ping_target }}.service live-video-eee.service
+# Retry forever: no start-rate limit -> no backoff, no cap.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 {{ lv_root }}/gnuradio/dvbs_tx.py
+User={{ lv_user }}
+SupplementaryGroups=video input
+RuntimeDirectory={{ lv_runtime_dir }}
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+StandardInput=null
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=live-video.target

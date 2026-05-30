@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Disable Energy Efficient Ethernet on {{ eth_iface }}
+Wants=network-pre.target
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# EEE causes link incompatibility. Disable it; tolerate NICs that lack EEE.
+ExecStart=-/usr/sbin/ethtool --set-eee {{ eth_iface }} eee off
+
+[Install]
+WantedBy=multi-user.target

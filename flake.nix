@@ -24,6 +24,9 @@
             pkg-config
             gcc
             mbuffer
+            # deploy: ansible-core only (playbook uses builtin modules, no collections)
+            ansible
+            ansible-lint
           ];
 
           buildInputs = with pkgs; [
