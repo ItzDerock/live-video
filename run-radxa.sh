@@ -18,10 +18,22 @@ WIDTH=1280
 HEIGHT=720
 FPS=30
 
-### ENCODER configuration
-BPS=2300000
-GOP=60          # keyframes every 2 s (GOP / FPS)
-MUX_BITRATE=2900000   # only used by the CBR-TS fallback (see bottom comment)
+# ### ENCODER configuration
+# BPS=2300000
+# GOP=60          # keyframes every 2 s (GOP / FPS)
+# MUX_BITRATE=2900000   # only used by the CBR-TS fallback (see bottom comment)
+
+# Rate control. VBR/AVBR let still scenes dip below TARGET_BPS so raptorq spends
+# the freed bits on repair symbols instead of TS null packets. Set RC_MODE=CBR
+# to restore the old constant-rate behaviour.
+RC_MODE="${RC_MODE:-VBR}"               # VBR | AVBR | CBR
+TARGET_BPS="${TARGET_BPS:-1500000}"     # -b:v     encoder target; dips lower on easy scenes (VBR/AVBR)
+MAXRATE_BPS="${MAXRATE_BPS:-2300000}"   # -maxrate hard ceiling (bits/s); keep <= channel payload capacity
+MINRATE_BPS="${MINRATE_BPS:-0}"         # -minrate floor (bits/s); keep 0/low so quiet scenes free bits for repair
+BUFSIZE_BITS="${BUFSIZE_BITS:-2300000}" # -bufsize VBV window (bits); smaller = tighter per-burst/I-frame cap
+GOP="${GOP:-60}"                        # keyframes every 2 s (GOP / FPS)
+BFRAMES="${BFRAMES:-0}"                 # -bf      B-frames; 0 for low latency
+MUX_BITRATE="${MUX_BITRATE:-2900000}"   # only used by the CBR-TS fallback (see bottom comment)
 
 ### OUTPUT configuration
 # Symbol rate * 2 (QPSK) * 3/4 (FEC rate) * 188/204 (RS overhead)
@@ -34,7 +46,7 @@ FONT="${FONT:-/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf}"
 RAPTORQ_ENC="${RAPTORQ_ENC:-./raptorq/target/release/raptorq-enc}"
 OVERLAY_PNG="${OVERLAY_PNG:-/run/live-video/duke-aero-overlay.png}"
 
-# Small jitter buffer only; NOT a 16M latency sink. ~1 MiB smooths I-frame
+# Small jitter buffer only — NOT a 16M latency sink. ~1 MiB smooths I-frame
 # bursts + 64 KiB raptorq blocks without hiding a sustained rate deficit.
 MBUF_SIZE="${MBUF_SIZE:-1M}"
 
@@ -91,8 +103,13 @@ fi
 # add it there too — but keep the terminating scale_rkrga.
 FILTERGRAPH="[1:v]format=bgra,hwupload[ovl];[0:v][ovl]overlay_rkrga=x=10:y=10:eof_action=repeat[ov];[ov]scale_rkrga=format=nv12[venc]"
 
+# Assemble HEVC rate-control args from the vars above. -minrate only when set,
+# so VBR/AVBR are free to floor on static scenes.
+RC_ARGS=( -rc_mode "$RC_MODE" -b:v "$TARGET_BPS" -maxrate "$MAXRATE_BPS" -bufsize "$BUFSIZE_BITS" )
+(( MINRATE_BPS > 0 )) && RC_ARGS+=( -minrate "$MINRATE_BPS" )
+
 FFMPEG_CMD=(
-  "$FFMPEG" -hide_banner -loglevel warning
+  "$FFMPEG" -hide_banner -loglevel warning -stats
   # Shared rkmpp hw device so input-1's hwupload lands in the SAME context
   # as the decoded main stream (mismatched contexts -> auto_scale failure).
   -init_hw_device rkmpp=rk -filter_hw_device rk
@@ -106,11 +123,12 @@ FFMPEG_CMD=(
   # all-hardware RGA blend -> NV12
   -filter_complex "$FILTERGRAPH"
   -map "[venc]"
-  # hardware HEVC, CBR (bounds bursts), no B-frames.
+  # hardware HEVC. VBR by default so quiet scenes drop bitrate and raptorq turns
+  # the slack into repair symbols; maxrate+bufsize bound bursts. RC_MODE=CBR for old behaviour.
   # NOTE: no -color_range here — on the HW path it forces a software range
   # conversion (swscale) that can't touch drm_prime and trips auto_scale.
   # Handle range inside RGA if needed; otherwise tag/convert on the RX side.
-  -c:v hevc_rkmpp -rc_mode CBR -b:v "$BPS" -g "$GOP" -bf 0
+  -c:v hevc_rkmpp "${RC_ARGS[@]}" -g "$GOP" -bf "$BFRAMES"
   # VBR transport stream — raptorq paces the channel, so no -muxrate here
   -f mpegts -flush_packets 1
   pipe:1
