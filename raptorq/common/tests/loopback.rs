@@ -50,6 +50,7 @@ fn decode_block(wire: &[[u8; TS_PACKET_SIZE]]) -> Option<Vec<u8>> {
                 oti,
                 payload_id,
                 symbol,
+                ..
             } => {
                 let d = dec.get_or_insert_with(|| {
                     SourceBlockDecoder::new(
@@ -64,7 +65,7 @@ fn decode_block(wire: &[[u8; TS_PACKET_SIZE]]) -> Option<Vec<u8>> {
                 let p = raptorq::EncodingPacket::new(payload_id, symbol);
                 result = d.decode(std::iter::once(p));
             }
-            ParsedFrame::Noop => {}
+            ParsedFrame::Noop { .. } => {}
         }
     }
     result
