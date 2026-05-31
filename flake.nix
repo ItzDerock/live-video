@@ -41,6 +41,9 @@
               ps.numpy
               ps.pyzmq
             ]))
+
+            mosquitto
+            socat
           ];
 
           shellHook = ''
