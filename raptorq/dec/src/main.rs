@@ -166,8 +166,16 @@ struct IntervalStats {
     /// sum of K for best-effort blocks
     be_syms_needed: u64,
     zero: u64,
+    /// data symbols accepted into a still-open block
     pkts_ok: u64,
-    pkts_dropped: u64,
+    /// noop/stuffing packets received
+    noops: u64,
+    /// data packets for a block already emitted: unneeded repair, NOT loss
+    pkts_redundant: u64,
+    /// packets that failed to parse (corruption); NOT counted as link loss
+    pkts_unparseable: u64,
+    /// packets that never arrived, inferred from continuity-counter gaps
+    pkts_lost: u64,
 }
 
 fn log_interval_stats(s: &IntervalStats, elapsed: f64) {
@@ -176,9 +184,22 @@ fn log_interval_stats(s: &IntervalStats, elapsed: f64) {
     } else {
         100
     };
-    let total_pkts = s.pkts_ok + s.pkts_dropped;
-    let drop_pct = if total_pkts > 0 {
-        s.pkts_dropped as f64 * 100.0 / total_pkts as f64
+    // Every parsed frame (data + noop) carries a continuity counter, so the
+    // count of packets that actually arrived on the wire is their sum. Add the
+    // gap-inferred losses to recover how many were sent.
+    let recv = s.pkts_ok + s.pkts_redundant + s.noops;
+    let sent = recv + s.pkts_lost;
+    let loss_pct = if sent > 0 {
+        s.pkts_lost as f64 * 100.0 / sent as f64
+    } else {
+        0.0
+    };
+    // Fraction of received DATA packets that were redundant repair. On a clean
+    // link this equals the encoder's repair overhead (e.g. 0.25/1.25 = 20%)
+    // and is expected, not loss.
+    let data_recv = s.pkts_ok + s.pkts_redundant;
+    let redundant_pct = if data_recv > 0 {
+        s.pkts_redundant as f64 * 100.0 / data_recv as f64
     } else {
         0.0
     };
@@ -191,8 +212,12 @@ fn log_interval_stats(s: &IntervalStats, elapsed: f64) {
         be_forced = s.be_forced,
         zero_blocks = s.zero,
         pkts_ok = s.pkts_ok,
-        pkts_dropped = s.pkts_dropped,
-        drop_pct = format!("{drop_pct:.2}"),
+        noops = s.noops,
+        redundant = s.pkts_redundant,
+        redundant_pct = format!("{redundant_pct:.2}"),
+        unparseable = s.pkts_unparseable,
+        lost = s.pkts_lost,
+        loss_pct = format!("{loss_pct:.2}"),
         "link stats",
     );
 }
@@ -201,6 +226,23 @@ fn unwrap_sbn(cursor: u64, sbn_u8: u8) -> u64 {
     let cursor_low = (cursor & 0xFF) as u8;
     let diff = sbn_u8.wrapping_sub(cursor_low) as i8 as i64;
     (cursor as i64 + diff).max(0) as u64
+}
+
+/// The TS continuity counter increments once per packet on the PID (mod 16),
+/// across both data and noop frames. A gap therefore means packets vanished in
+/// transit — genuine link loss. Returns the number missed since the previous
+/// packet and updates `last_cc`. Bursts of >= 16 consecutive losses alias the
+/// 4-bit field and are undercounted.
+fn cc_gap(last_cc: &mut Option<u8>, cc: u8) -> u64 {
+    let gap = match *last_cc {
+        Some(prev) => {
+            let expected = (prev + 1) & 0x0F;
+            (cc.wrapping_sub(expected) as u64) & 0x0F
+        }
+        None => 0,
+    };
+    *last_cc = Some(cc);
+    gap
 }
 
 fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
@@ -220,7 +262,9 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
     let mut decoded_blocks = 0u64;
     let mut besteffort_blocks = 0u64;
     let mut zero_blocks = 0u64;
-    let mut dropped_packets = 0u64;
+    let mut redundant_packets = 0u64;
+    let mut lost_packets = 0u64;
+    let mut last_cc: Option<u8> = None;
 
     let mut istats = IntervalStats::default();
     let mut last_stats = Instant::now();
@@ -229,10 +273,14 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
         match rx.recv_timeout(poll_tick) {
             Ok(bytes) => match parse_packet(&bytes, pid) {
                 Ok(ParsedFrame::Data {
+                    cc,
                     oti,
                     payload_id,
                     symbol,
                 }) => {
+                    let gap = cc_gap(&mut last_cc, cc);
+                    istats.pkts_lost += gap;
+                    lost_packets += gap;
                     let sbn_u8 = payload_id.source_block_number();
                     let logical = if started {
                         unwrap_sbn(cursor, sbn_u8)
@@ -243,9 +291,10 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
                         sbn_u8 as u64
                     };
                     if logical < cursor {
-                        dropped_packets += 1;
-                        istats.pkts_dropped += 1;
-                        trace!(logical, cursor, "stale packet dropped");
+                        // Block already emitted; this is unneeded repair, not loss.
+                        redundant_packets += 1;
+                        istats.pkts_redundant += 1;
+                        trace!(logical, cursor, "redundant packet (block already emitted)");
                         continue;
                     }
                     if logical > highest_seen {
@@ -258,10 +307,16 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
                     let pkt = EncodingPacket::new(payload_id, symbol);
                     entry.ingest(pkt);
                 }
-                Ok(ParsedFrame::Noop) => {}
+                Ok(ParsedFrame::Noop { cc }) => {
+                    let gap = cc_gap(&mut last_cc, cc);
+                    istats.pkts_lost += gap;
+                    lost_packets += gap;
+                    istats.noops += 1;
+                }
                 Err(e) => {
-                    dropped_packets += 1;
-                    istats.pkts_dropped += 1;
+                    // Corrupt frame: cannot read its cc, so it is bucketed
+                    // separately rather than counted as a continuity gap.
+                    istats.pkts_unparseable += 1;
                     trace!(error = %e, "dropping unparseable packet");
                 }
             },
@@ -269,7 +324,11 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
             Err(RecvTimeoutError::Disconnected) => {
                 info!(
                     decoded_blocks,
-                    besteffort_blocks, zero_blocks, dropped_packets, "input closed; flushing"
+                    besteffort_blocks,
+                    zero_blocks,
+                    redundant_packets,
+                    lost_packets,
+                    "input closed; flushing"
                 );
                 flush_remaining(&mut pool, &mut cursor, &mut stdout)?;
                 return Ok(());

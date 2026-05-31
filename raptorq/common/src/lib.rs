@@ -143,11 +143,17 @@ pub fn build_noop_packet(pid: u16, cc: u8, out: &mut [u8; TS_PACKET_SIZE]) {
 #[derive(Debug)]
 pub enum ParsedFrame {
     Data {
+        /// 4-bit TS continuity counter; gaps across consecutive frames reveal
+        /// packets lost in transit.
+        cc: u8,
         oti: ObjectTransmissionInformation,
         payload_id: PayloadId,
         symbol: Vec<u8>,
     },
-    Noop,
+    Noop {
+        /// 4-bit TS continuity counter; see [`ParsedFrame::Data`].
+        cc: u8,
+    },
 }
 
 pub fn parse_packet(bytes: &[u8], expected_pid: u16) -> Result<ParsedFrame, ParseError> {
@@ -168,7 +174,9 @@ pub fn parse_packet(bytes: &[u8], expected_pid: u16) -> Result<ParsedFrame, Pars
     let payload = &bytes[TS_HEADER_SIZE..];
     let frame_type = payload[FRAME_TYPE_OFFSET];
     match frame_type {
-        FRAME_TYPE_NOOP => Ok(ParsedFrame::Noop),
+        FRAME_TYPE_NOOP => Ok(ParsedFrame::Noop {
+            cc: hdr.continuity_counter,
+        }),
         FRAME_TYPE_DATA => {
             let oti_bytes: [u8; 12] = payload[FRAME_OTI_OFFSET..FRAME_OTI_OFFSET + 12]
                 .try_into()
@@ -180,6 +188,7 @@ pub fn parse_packet(bytes: &[u8], expected_pid: u16) -> Result<ParsedFrame, Pars
             let payload_id = PayloadId::deserialize(&pid_bytes);
             let symbol = payload[FRAME_SYMBOL_OFFSET..FRAME_SYMBOL_OFFSET + SYMBOL_SIZE].to_vec();
             Ok(ParsedFrame::Data {
+                cc: hdr.continuity_counter,
                 oti,
                 payload_id,
                 symbol,
@@ -228,7 +237,7 @@ mod tests {
         let mut buf = [0u8; TS_PACKET_SIZE];
         build_noop_packet(0x100, 3, &mut buf);
         match parse_packet(&buf, 0x100).unwrap() {
-            ParsedFrame::Noop => {}
+            ParsedFrame::Noop { cc } => assert_eq!(cc, 3),
             other => panic!("expected noop, got {:?}", other),
         }
     }
@@ -243,10 +252,12 @@ mod tests {
         build_data_packet(0x100, 5, &oti, &src[0], &mut buf);
         match parse_packet(&buf, 0x100).unwrap() {
             ParsedFrame::Data {
+                cc,
                 oti: got_oti,
                 payload_id,
                 symbol,
             } => {
+                assert_eq!(cc, 5);
                 assert_eq!(got_oti.transfer_length(), oti.transfer_length());
                 assert_eq!(payload_id.source_block_number(), 7);
                 assert_eq!(payload_id.encoding_symbol_id(), 0);
