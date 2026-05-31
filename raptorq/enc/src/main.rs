@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::option::Option;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
@@ -42,9 +43,26 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_BLOCK_SIZE)]
     block_size: usize,
 
-    /// Fraction of repair symbols added per block.
+    /// Baseline (floor) fraction of repair symbols added per block, always sent
+    /// in-band. With adaptive FEC this is the minimum; idle airtime adds more.
     #[arg(long, default_value_t = DEFAULT_REPAIR_OVERHEAD)]
     repair_overhead: f32,
+
+    /// Use otherwise-idle airtime to send extra repair symbols for recent
+    /// in-flight blocks instead of noop stuffing. Floors at --repair-overhead.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    adaptive_fec: bool,
+
+    /// Ceiling on per-block repair fraction when adaptive FEC fills idle
+    /// airtime. total >= K/(1-p) survives loss fraction p; 1.0 => survive ~50%.
+    #[arg(long, default_value_t = 1.0)]
+    max_repair_overhead: f32,
+
+    /// How long extra repair for a block stays useful, i.e. how long the
+    /// decoder is expected to hold it. Should track the decoder's
+    /// --block-timeout-ms. Blocks older than this get no extra repair.
+    #[arg(long, default_value_t = 700)]
+    repair_horizon_ms: u64,
 
     /// TS PID for our framed packets.
     #[arg(long, value_parser = parse_pid, default_value = "0x100")]
@@ -92,16 +110,24 @@ fn main() -> Result<()> {
         anyhow::bail!("repair_overhead must be >= 0");
     }
 
+    if !args.max_repair_overhead.is_finite() || args.max_repair_overhead < args.repair_overhead {
+        anyhow::bail!("max_repair_overhead must be finite and >= repair_overhead");
+    }
+
     if args.rate == 0 {
         anyhow::bail!("rate must be > 0");
     }
 
     let k = (args.block_size / SYMBOL_SIZE) as u32;
     let repair = (k as f32 * args.repair_overhead).ceil() as u32;
+    let max_repair = (k as f32 * args.max_repair_overhead).ceil() as u32;
     info!(
         block_size = args.block_size,
         k,
         repair,
+        adaptive_fec = args.adaptive_fec,
+        max_repair,
+        repair_horizon_ms = args.repair_horizon_ms,
         rate_bps = args.rate,
         pid = format!("{:#x}", args.pid),
         "encoder configured"
@@ -134,7 +160,17 @@ fn main() -> Result<()> {
 
     let encoder = thread::Builder::new()
         .name("block-encoder".into())
-        .spawn(move || encoder_thread(oti, repair, block_rx, pkt_tx))?;
+        .spawn(move || {
+            encoder_thread(
+                oti,
+                repair,
+                max_repair,
+                args.adaptive_fec,
+                Duration::from_millis(args.repair_horizon_ms),
+                block_rx,
+                pkt_tx,
+            )
+        })?;
 
     let writer = thread::Builder::new()
         .name("paced-writer".into())
@@ -184,40 +220,199 @@ fn reader_thread(block_size: usize, out: SyncSender<Vec<u8>>) -> Result<()> {
     }
 }
 
+/// A recently-encoded block kept alive so idle airtime can mint more repair
+/// symbols for it on demand. RaptorQ is a fountain code, so repair is unbounded.
+struct BlockGen {
+    encoder: SourceBlockEncoder,
+    /// Next repair symbol id to generate; starts past the in-band baseline.
+    next_repair_id: u32,
+    /// Ceiling on total repair symbols for this block (--max-repair-overhead).
+    max_repair: u32,
+    /// When the block's source went out; used to drop it once the decoder would
+    /// no longer be holding it.
+    created: Instant,
+}
+
+impl BlockGen {
+    fn exhausted(&self) -> bool {
+        self.next_repair_id >= self.max_repair
+    }
+}
+
+/// Cheap deterministic PRNG (xorshift64) for recency-weighted repair targeting.
+struct Xorshift64(u64);
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    /// ~50/50 coin flip.
+    fn coin(&mut self) -> bool {
+        (self.next_u64() >> 33) & 1 == 1
+    }
+}
+
+/// Hard cap on retained blocks, guarding against a very large horizon.
+const MAX_RING: usize = 64;
+
+/// Drop blocks the decoder would no longer hold (older than the horizon) or that
+/// hit their repair ceiling, and enforce the ring cap. Created times are
+/// monotonic, so only the front needs horizon checking.
+fn prune_ring(ring: &mut VecDeque<BlockGen>, horizon: Duration) {
+    while ring.len() > MAX_RING {
+        ring.pop_front();
+    }
+    while let Some(front) = ring.front() {
+        if front.created.elapsed() > horizon || front.exhausted() {
+            ring.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Pick which live block gets the next idle repair symbol, weighted toward the
+/// freshest (geometric: freshest 1/2, next 1/4, ...). The freshest block is the
+/// one most likely still in the decoder's pool; spreading to older live blocks
+/// hedges against a loss burst the (feedback-less) encoder cannot see. Returns a
+/// deque index, or None if every retained block is exhausted.
+fn pick_block(ring: &VecDeque<BlockGen>, rng: &mut Xorshift64) -> Option<usize> {
+    let mut oldest_live = None;
+    // Freshest (back) -> oldest (front). Horizon already enforced by prune_ring.
+    for i in (0..ring.len()).rev() {
+        if ring[i].exhausted() {
+            continue;
+        }
+        oldest_live = Some(i);
+        if rng.coin() {
+            return Some(i);
+        }
+    }
+    oldest_live
+}
+
+/// Encode one input block: emit its source symbols plus the baseline repair,
+/// interleaved. Returns the live encoder for the repair ring, or `Err(())` if
+/// the writer has gone away (signalling the thread to exit).
+fn emit_block(
+    block: &[u8],
+    sbn: u8,
+    oti: &ObjectTransmissionInformation,
+    baseline_repair: u32,
+    rep_interval: u32,
+    out: &SyncSender<EncodingPacket>,
+) -> std::result::Result<SourceBlockEncoder, ()> {
+    let encoder = SourceBlockEncoder::new(sbn, oti, block);
+    let source = encoder.source_packets();
+    let repair_pkts = encoder.repair_packets(0, baseline_repair);
+    debug!(
+        sbn,
+        src = source.len(),
+        repair = repair_pkts.len(),
+        "block encoded"
+    );
+    for p in interleave(source, repair_pkts, rep_interval) {
+        if out.send(p).is_err() {
+            warn!("writer dropped; encoder exiting");
+            return Err(());
+        }
+    }
+    Ok(encoder)
+}
+
 fn encoder_thread(
     oti: ObjectTransmissionInformation,
-    repair: u32,
+    baseline_repair: u32,
+    max_repair: u32,
+    adaptive: bool,
+    horizon: Duration,
     blocks: Receiver<Vec<u8>>,
     out: SyncSender<EncodingPacket>,
 ) -> Result<()> {
     let block_size = oti.transfer_length() as usize;
+    let k_block = (block_size / SYMBOL_SIZE) as u32;
+    let rep_interval = if baseline_repair > 0 {
+        (k_block / baseline_repair).max(1)
+    } else {
+        u32::MAX
+    };
     let mut sbn: u8 = 0;
-    while let Ok(block) = blocks.recv() {
-        debug_assert_eq!(block.len(), block_size);
-        let encoder = SourceBlockEncoder::new(sbn, &oti, &block);
-        let source = encoder.source_packets();
-        let repair_pkts = encoder.repair_packets(0, repair);
-        debug!(
-            sbn,
-            src = source.len(),
-            repair = repair_pkts.len(),
-            "block encoded"
-        );
-        let k_block = (block_size / SYMBOL_SIZE) as u32;
-        let rep_interval = if repair > 0 {
-            (k_block / repair).max(1)
-        } else {
-            u32::MAX
-        };
-        for p in interleave(source, repair_pkts, rep_interval) {
-            if out.send(p).is_err() {
-                warn!("writer dropped; encoder exiting");
+
+    // Non-adaptive (or no headroom above the floor): original behaviour —
+    // baseline repair only, block on input.
+    if !adaptive || max_repair <= baseline_repair {
+        while let Ok(block) = blocks.recv() {
+            debug_assert_eq!(block.len(), block_size);
+            if emit_block(&block, sbn, &oti, baseline_repair, rep_interval, &out).is_err() {
+                return Ok(());
+            }
+            sbn = sbn.wrapping_add(1);
+        }
+        return Ok(());
+    }
+
+    // Adaptive: fill otherwise-idle airtime with extra repair for recent blocks
+    // instead of letting the writer emit noop stuffing. The bounded packet
+    // channel backpressures `out.send`, so this self-paces to the writer's rate
+    // and only fires when there is genuine slack.
+    let mut ring: VecDeque<BlockGen> = VecDeque::new();
+    let mut rng = Xorshift64::new(0x9E37_79B9_7F4A_7C15);
+    let idle_nap = Duration::from_millis(2);
+
+    loop {
+        match blocks.try_recv() {
+            Ok(block) => {
+                debug_assert_eq!(block.len(), block_size);
+                let encoder =
+                    match emit_block(&block, sbn, &oti, baseline_repair, rep_interval, &out) {
+                        Ok(e) => e,
+                        Err(()) => return Ok(()),
+                    };
+                ring.push_back(BlockGen {
+                    encoder,
+                    next_repair_id: baseline_repair,
+                    max_repair,
+                    created: Instant::now(),
+                });
+                prune_ring(&mut ring, horizon);
+                sbn = sbn.wrapping_add(1);
+                continue;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                info!("input closed; encoder exiting");
                 return Ok(());
             }
         }
-        sbn = sbn.wrapping_add(1);
+
+        // No fresh input: spend the idle slot on extra repair, if any block is
+        // still worth protecting.
+        prune_ring(&mut ring, horizon);
+        if let Some(idx) = pick_block(&ring, &mut rng) {
+            let bg = &mut ring[idx];
+            let extra = bg.encoder.repair_packets(bg.next_repair_id, 1).pop();
+            bg.next_repair_id += 1;
+            if let Some(p) = extra {
+                if out.send(p).is_err() {
+                    warn!("writer dropped; encoder exiting");
+                    return Ok(());
+                }
+            }
+            continue;
+        }
+
+        // Genuinely nothing useful to send (no input, nothing left to protect).
+        // Nap briefly; the writer covers this gap with noop stuffing.
+        thread::sleep(idle_nap);
     }
-    Ok(())
 }
 
 fn writer_thread(
@@ -326,6 +521,8 @@ mod tests {
     use super::*;
     use raptorq::SourceBlockEncoder;
     use raptorq_ts_common::{make_block_oti, DEFAULT_BLOCK_SIZE, DEFAULT_REPAIR_OVERHEAD, SYMBOL_SIZE};
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
 
     fn make_packets(k: u32, repair: u32) -> (Vec<EncodingPacket>, Vec<EncodingPacket>) {
         let block_size = k as usize * SYMBOL_SIZE;
@@ -413,5 +610,94 @@ mod tests {
             "too many repairs lost in burst: {} surviving out of {repair}",
             repairs_surviving
         );
+    }
+
+    fn dummy_blockgen(next_repair_id: u32, max_repair: u32, created: Instant) -> BlockGen {
+        let k = 8u32;
+        let block_size = k as usize * SYMBOL_SIZE;
+        let oti = make_block_oti(block_size as u64, SYMBOL_SIZE as u16);
+        let encoder = SourceBlockEncoder::new(0, &oti, &vec![0u8; block_size]);
+        BlockGen {
+            encoder,
+            next_repair_id,
+            max_repair,
+            created,
+        }
+    }
+
+    #[test]
+    fn pick_block_prefers_freshest() {
+        let now = Instant::now();
+        let mut ring: VecDeque<BlockGen> = VecDeque::new();
+        // 3 live blocks; freshest is the back (index 2).
+        for _ in 0..3 {
+            ring.push_back(dummy_blockgen(0, 100, now));
+        }
+        let mut rng = Xorshift64::new(0x1234_5678);
+        let n = 20_000;
+        let mut counts = [0usize; 3];
+        for _ in 0..n {
+            counts[pick_block(&ring, &mut rng).unwrap()] += 1;
+        }
+        // Freshest dominates and lands near the geometric 1/2.
+        assert!(
+            counts[2] > counts[1] && counts[2] > counts[0],
+            "freshest should dominate: {counts:?}"
+        );
+        let frac = counts[2] as f64 / n as f64;
+        assert!((0.45..0.55).contains(&frac), "freshest ~1/2: {counts:?}");
+    }
+
+    #[test]
+    fn pick_block_skips_exhausted() {
+        let now = Instant::now();
+        let mut ring: VecDeque<BlockGen> = VecDeque::new();
+        ring.push_back(dummy_blockgen(0, 100, now)); // live
+        ring.push_back(dummy_blockgen(50, 50, now)); // exhausted (freshest)
+        let mut rng = Xorshift64::new(7);
+        for _ in 0..1000 {
+            assert_eq!(pick_block(&ring, &mut rng), Some(0));
+        }
+    }
+
+    #[test]
+    fn pick_block_none_when_all_exhausted() {
+        let now = Instant::now();
+        let mut ring: VecDeque<BlockGen> = VecDeque::new();
+        ring.push_back(dummy_blockgen(50, 50, now));
+        let mut rng = Xorshift64::new(1);
+        assert_eq!(pick_block(&ring, &mut rng), None);
+    }
+
+    #[test]
+    fn prune_ring_drops_exhausted_and_expired_front() {
+        let now = Instant::now();
+        let horizon = Duration::from_millis(500);
+
+        // Exhausted front is dropped, live block kept.
+        let mut ring: VecDeque<BlockGen> = VecDeque::new();
+        ring.push_back(dummy_blockgen(50, 50, now));
+        ring.push_back(dummy_blockgen(0, 100, now));
+        prune_ring(&mut ring, horizon);
+        assert_eq!(ring.len(), 1);
+        assert!(!ring[0].exhausted());
+
+        // Expired front (older than horizon) is dropped.
+        if let Some(old) = now.checked_sub(Duration::from_secs(5)) {
+            let mut ring: VecDeque<BlockGen> = VecDeque::new();
+            ring.push_back(dummy_blockgen(0, 100, old));
+            ring.push_back(dummy_blockgen(0, 100, now));
+            prune_ring(&mut ring, horizon);
+            assert_eq!(ring.len(), 1);
+        }
+    }
+
+    #[test]
+    fn coin_is_roughly_fair() {
+        let mut rng = Xorshift64::new(0xDEAD_BEEF);
+        let n = 100_000;
+        let heads = (0..n).filter(|_| rng.coin()).count();
+        let frac = heads as f64 / n as f64;
+        assert!((0.47..0.53).contains(&frac), "coin biased: {frac}");
     }
 }
