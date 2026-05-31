@@ -1,0 +1,6 @@
+# USB gadget — internet via host (10.55.0.2)
+allow-hotplug usb0
+iface usb0 inet manual
+    post-up /sbin/ip route replace default via 10.55.0.2 dev usb0
+    post-up printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf
+    pre-down /sbin/ip route del default via 10.55.0.2 dev usb0 2>/dev/null || true

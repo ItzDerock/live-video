@@ -17,6 +17,8 @@ SupplementaryGroups=video input
 RuntimeDirectory={{ lv_runtime_dir }}
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
+Environment=ZMQ_SOCK={{ lv_socket }}
+Environment=RAPTORQ_ENC={{ lv_bin }}/raptorq-enc
 Restart=always
 RestartSec=2
 

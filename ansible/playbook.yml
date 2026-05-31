@@ -72,6 +72,12 @@
             create_home: true
             home: "{{ lv_home }}"
 
+      - name: Add livevideo user to render group
+        ansible.builtin.user:
+            name: "{{ lv_user }}"
+            groups: [render]
+            append: true
+
       # --- Rust toolchain (rustup, as livevideo) --------------------------------
       - name: Download rustup installer
         ansible.builtin.get_url:
@@ -156,13 +162,23 @@
             mode: preserve
 
       # --- run.sh ---------------------------------------------------------------
-      - name: Install run.sh
+      - name: Install run.sh (pi)
         ansible.builtin.template:
             src: run.sh.j2
             dest: "{{ lv_root }}/run.sh"
             owner: "{{ lv_user }}"
             group: "{{ lv_group }}"
             mode: "0755"
+        when: "'radxa' not in group_names"
+
+      - name: Install run.sh (radxa)
+        ansible.builtin.copy:
+            src: "{{ repo_root }}/run-radxa.sh"
+            dest: "{{ lv_root }}/run.sh"
+            owner: "{{ lv_user }}"
+            group: "{{ lv_group }}"
+            mode: "0755"
+        when: "'radxa' in group_names"
 
       # --- udev rule ------------------------------------------------------------
       - name: Install rocket-cam udev rule
@@ -173,6 +189,49 @@
             group: root
             mode: "0644"
         notify: Reload udev
+
+      # --- network interfaces ---------------------------------------------------
+      - name: Install pluto ethernet interface config
+        ansible.builtin.copy:
+            src: 99-pluto-eth
+            dest: /etc/network/interfaces.d/99-pluto-eth
+            owner: root
+            group: root
+            mode: "0644"
+
+      # --- radxa-specific -------------------------------------------------------
+      - name: Download jellyfin-ffmpeg deb (radxa)
+        ansible.builtin.get_url:
+            url: "https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v7.1.4-1/jellyfin-ffmpeg7_7.1.4-1-trixie_arm64.deb"
+            dest: /tmp/jellyfin-ffmpeg7.deb
+            mode: "0644"
+            force: false
+        when: "'radxa' in group_names"
+
+      - name: Install jellyfin-ffmpeg (radxa)
+        ansible.builtin.apt:
+            deb: /tmp/jellyfin-ffmpeg7.deb
+            state: present
+        when: "'radxa' in group_names"
+
+      - name: Install Rockchip media udev rules (radxa)
+        ansible.builtin.copy:
+            src: 99-rockchip-media.rules
+            dest: /etc/udev/rules.d/99-rockchip-media.rules
+            owner: root
+            group: root
+            mode: "0644"
+        notify: Reload udev
+        when: "'radxa' in group_names"
+
+      - name: Install USB gadget interface config (radxa)
+        ansible.builtin.copy:
+            src: usb0-gadget
+            dest: /etc/network/interfaces.d/usb0
+            owner: root
+            group: root
+            mode: "0644"
+        when: "'radxa' in group_names"
 
       # --- systemd units --------------------------------------------------------
       - name: Install systemd units

@@ -1,6 +1,13 @@
 # Example inventory. Replace host/connection details for your board.
-[sbc]
-rocket-cam ansible_host=192.168.1.132 ansible_user=dietpi
+[pi]
+rocket-cam ansible_host=10.55.0.1 ansible_user=dietpi
+
+[radxa]
+bigbrother ansible_host=10.55.0.3 ansible_user=dietpi
+
+[sbc:children]
+pi
+radxa
 
 [sbc:vars]
 ansible_python_interpreter=/usr/bin/python3
