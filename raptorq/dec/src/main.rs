@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -258,7 +258,7 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
     let mut highest_seen: u64 = 0;
     let mut started = false;
 
-    let mut stdout = std::io::stdout().lock();
+    let mut stdout = BufWriter::new(std::io::stdout().lock());
     let mut decoded_blocks = 0u64;
     let mut besteffort_blocks = 0u64;
     let mut zero_blocks = 0u64;
@@ -331,6 +331,7 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
                     "input closed; flushing"
                 );
                 flush_remaining(&mut pool, &mut cursor, &mut stdout)?;
+                stdout.flush().context("flushing stdout")?;
                 return Ok(());
             }
         }
@@ -390,6 +391,10 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
                 _ => break,
             }
         }
+
+        // Push every emitted block downstream immediately; otherwise blocks sit
+        // in the buffer and the player stalls (and a killed process loses them).
+        stdout.flush().context("flushing stdout")?;
 
         if let Some(interval) = stats_interval {
             let elapsed = last_stats.elapsed();

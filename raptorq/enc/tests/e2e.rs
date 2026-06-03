@@ -6,12 +6,15 @@
 //! at test start to ensure it exists.
 
 use std::io::{Read, Write, ErrorKind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use raptorq_ts_common::{DEFAULT_BLOCK_SIZE, TS_PACKET_SIZE};
+use raptorq_ts_common::{
+    DEFAULT_BLOCK_SIZE, FRAME_TYPE_DATA, FRAME_TYPE_NOOP, FRAME_TYPE_OFFSET, TS_HEADER_SIZE,
+    TS_PACKET_SIZE,
+};
 
 fn bins() -> (PathBuf, PathBuf) {
     let enc = PathBuf::from(env!("CARGO_BIN_EXE_raptorq-enc"));
@@ -284,5 +287,104 @@ fn enc_dec_loopback_with_random_drops() {
         &out[..input.len()],
         &input[..],
         "decoded byte stream does not match input under 10% loss"
+    );
+}
+
+/// Spawn the encoder with one block of input but stdin held open (so it sits
+/// idle with airtime to spare), sample ~`window` of output, and count DATA vs
+/// NOOP frames.
+fn count_frames(enc: &Path, adaptive: bool, input: &[u8]) -> (usize, usize) {
+    let mut proc = Command::new(enc)
+        .args([
+            "--rate",
+            "8000000",
+            "--adaptive-fec",
+            if adaptive { "true" } else { "false" },
+            "--max-repair-overhead",
+            "5.0",
+            "--repair-horizon-ms",
+            "5000",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn enc");
+
+    let mut stdin = proc.stdin.take().unwrap();
+    let mut stdout = proc.stdout.take().unwrap();
+
+    let owned = input.to_vec();
+    let writer = thread::spawn(move || {
+        stdin.write_all(&owned).ok();
+        // Keep stdin open: the encoder waits for the next block and the writer
+        // has idle airtime to fill.
+        thread::sleep(Duration::from_millis(500));
+        drop(stdin);
+    });
+
+    let window = Duration::from_millis(250);
+    let reader = thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut buf = [0u8; 8192];
+        let start = std::time::Instant::now();
+        while start.elapsed() < window {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        all
+    });
+
+    let out = reader.join().unwrap();
+    let _ = writer.join();
+    let _ = proc.kill();
+    let _ = proc.wait();
+
+    let mut data = 0usize;
+    let mut noop = 0usize;
+    for pkt in out.chunks_exact(TS_PACKET_SIZE) {
+        match pkt[TS_HEADER_SIZE + FRAME_TYPE_OFFSET] {
+            FRAME_TYPE_DATA => data += 1,
+            FRAME_TYPE_NOOP => noop += 1,
+            _ => {}
+        }
+    }
+    (data, noop)
+}
+
+#[test]
+fn adaptive_fec_fills_idle_with_repair_not_noops() {
+    let (enc, _dec) = bins();
+    // Slightly more than one block so exactly one full block is encoded; the
+    // rest of stdin stays open and idle.
+    let ts_packets = DEFAULT_BLOCK_SIZE / TS_PACKET_SIZE + 1;
+    let input = fake_ts_stream(ts_packets, 7);
+    // One block = K source + 25% baseline repair.
+    let baseline_data = DEFAULT_BLOCK_SIZE / 167 + (DEFAULT_BLOCK_SIZE / 167) / 4;
+
+    let (adaptive_data, adaptive_noop) = count_frames(&enc, true, &input);
+    let (plain_data, plain_noop) = count_frames(&enc, false, &input);
+
+    // Adaptive turns idle airtime into extra repair: more DATA frames than the
+    // single block's baseline, and far more than the non-adaptive run.
+    assert!(
+        adaptive_data > baseline_data,
+        "adaptive should mint repair beyond baseline {baseline_data}: got {adaptive_data}"
+    );
+    assert!(
+        adaptive_data > plain_data,
+        "adaptive should emit more DATA than plain: adaptive={adaptive_data}, plain={plain_data}"
+    );
+    // Non-adaptive fills the same idle airtime with noop stuffing instead.
+    assert!(
+        plain_noop > 100,
+        "plain run should emit noop stuffing: got {plain_noop}"
+    );
+    assert!(
+        adaptive_noop * 4 < plain_noop,
+        "adaptive should nearly eliminate noops: adaptive={adaptive_noop}, plain={plain_noop}"
     );
 }
