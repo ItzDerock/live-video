@@ -40,6 +40,26 @@ fn parse_pid(s: &str) -> std::result::Result<u16, String> {
     u16::from_str_radix(s, 16).map_err(|e| format!("invalid pid {s:?}: {e}"))
 }
 
+/// Largest K (source symbols per block) the raptorq decoder accepts; building a
+/// `SourceBlockDecoder` with more trips an assertion deep inside the crate
+/// (`systematic_constants::extended_source_block_symbols`). Mirrors raptorq's
+/// private `MAX_SOURCE_SYMBOLS_PER_BLOCK`.
+const MAX_SOURCE_SYMBOLS_PER_BLOCK: u64 = 56403;
+
+/// Reject OTIs that a corrupt-but-still-parseable DATA frame can carry. The link
+/// is lossy, so a packet can pass TS framing (sync, PID, frame type) yet hold
+/// garbage in its OTI field. Our encoder always uses the fixed wire `SYMBOL_SIZE`
+/// and a block whose K is in range, so anything else is corruption. Feeding it on
+/// would divide-by-zero (`symbol_size == 0`) or trip raptorq's K assertion.
+fn oti_is_sane(oti: &ObjectTransmissionInformation) -> bool {
+    if oti.symbol_size() as usize != SYMBOL_SIZE {
+        return false;
+    }
+    let sym = SYMBOL_SIZE as u64;
+    let transfer = oti.transfer_length();
+    transfer > 0 && transfer % sym == 0 && (transfer / sym) <= MAX_SOURCE_SYMBOLS_PER_BLOCK
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -63,7 +83,12 @@ fn main() -> Result<()> {
         .spawn(move || reader_thread(tx))?;
 
     let result = run_decoder(rx, args);
-    reader.join().expect("reader panicked").ok();
+    // Don't let a reader-thread panic re-panic the main thread on shutdown.
+    match reader.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = %e, "reader thread exited with error"),
+        Err(_) => warn!("reader thread panicked"),
+    }
     result
 }
 
@@ -281,6 +306,14 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
                     let gap = cc_gap(&mut last_cc, cc);
                     istats.pkts_lost += gap;
                     lost_packets += gap;
+                    if !oti_is_sane(&oti) {
+                        // Parsed as DATA but the OTI is garbage (corruption that
+                        // slipped past TS framing). Building a decoder from it
+                        // would panic, so drop it like any unusable frame.
+                        istats.pkts_unparseable += 1;
+                        trace!("dropping data frame with insane OTI");
+                        continue;
+                    }
                     let sbn_u8 = payload_id.source_block_number();
                     let logical = if started {
                         unwrap_sbn(cursor, sbn_u8)
@@ -346,7 +379,12 @@ fn run_decoder(rx: Receiver<Vec<u8>>, args: Args) -> Result<()> {
 
             match pool.get(&cursor) {
                 Some(b) if b.completed.is_some() => {
-                    let data = pool.remove(&cursor).unwrap().completed.unwrap();
+                    // Guard guarantees both are Some; degrade to break rather
+                    // than unwrap-panic if that ever stops holding.
+                    let data = match pool.remove(&cursor).and_then(|b| b.completed) {
+                        Some(d) => d,
+                        None => break,
+                    };
                     stdout.write_all(&data).context("writing stdout")?;
                     decoded_blocks += 1;
                     istats.decoded += 1;
@@ -443,5 +481,38 @@ mod tests {
     #[test]
     fn unwrap_sbn_stale() {
         assert_eq!(unwrap_sbn(300, 200), 200);
+    }
+
+    fn default_oti() -> ObjectTransmissionInformation {
+        raptorq_ts_common::make_block_oti(
+            raptorq_ts_common::DEFAULT_BLOCK_SIZE as u64,
+            SYMBOL_SIZE as u16,
+        )
+    }
+
+    #[test]
+    fn oti_sane_accepts_encoder_default() {
+        // Round-trip through the wire form the decoder actually deserializes.
+        let oti = ObjectTransmissionInformation::deserialize(&default_oti().serialize());
+        assert!(oti_is_sane(&oti));
+    }
+
+    #[test]
+    fn oti_sane_rejects_corrupt_oti() {
+        // Huge transfer_length, valid symbol size -> K far over the raptorq cap.
+        // This is the exact corruption that used to panic the decoder; note
+        // deserialize() does no validation, so only oti_is_sane stops it.
+        let mut bytes = default_oti().serialize();
+        bytes[0] = 0xFF;
+        bytes[1] = 0xFF;
+        assert!(!oti_is_sane(&ObjectTransmissionInformation::deserialize(&bytes)));
+
+        // All-0xFF garbage: wrong symbol size.
+        assert!(!oti_is_sane(&ObjectTransmissionInformation::deserialize(&[0xFF; 12])));
+
+        // In-range transfer length that is not a whole number of symbols.
+        let mut bytes = default_oti().serialize();
+        bytes[4] = bytes[4].wrapping_add(1);
+        assert!(!oti_is_sane(&ObjectTransmissionInformation::deserialize(&bytes)));
     }
 }
