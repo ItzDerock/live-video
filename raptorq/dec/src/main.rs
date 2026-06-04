@@ -77,6 +77,16 @@ fn main() -> Result<()> {
         "decoder configured"
     );
 
+    // Pay raptorq's ~300ms first-block table-build cost now rather than stalling
+    // the first decode mid-stream. Warms K for the default block size; a stream
+    // using a different size re-warms once on its first block.
+    let warm = Instant::now();
+    raptorq_ts_common::warm_raptorq(
+        raptorq_ts_common::DEFAULT_BLOCK_SIZE as u64,
+        SYMBOL_SIZE as u16,
+    );
+    debug!(elapsed_ms = warm.elapsed().as_millis() as u64, "raptorq tables warmed");
+
     let (tx, rx) = sync_channel::<Vec<u8>>(1024);
     let reader = thread::Builder::new()
         .name("ts-reader".into())

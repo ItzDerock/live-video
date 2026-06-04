@@ -1,6 +1,9 @@
 //! Wire format and TS-packet helpers shared by raptorq-enc and raptorq-dec.
 
-use raptorq::{EncodingPacket, ObjectTransmissionInformation, PayloadId};
+use raptorq::{
+    EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockDecoder,
+    SourceBlockEncoder,
+};
 use thiserror::Error;
 
 pub const TS_PACKET_SIZE: usize = 188;
@@ -13,7 +16,19 @@ pub const FRAME_OTI_OFFSET: usize = 1;
 pub const FRAME_PAYLOAD_ID_OFFSET: usize = 13;
 pub const FRAME_SYMBOL_OFFSET: usize = 17;
 pub const FRAME_OVERHEAD: usize = FRAME_SYMBOL_OFFSET;
-pub const SYMBOL_SIZE: usize = TS_PAYLOAD_SIZE - FRAME_OVERHEAD;
+
+/// Size of the CRC-32 trailer appended to every frame. RaptorQ is an erasure
+/// code: it recovers *missing* symbols but trusts every symbol it receives
+/// bit-exact. The DVB-S RS layer can miscorrect a burst and hand up a corrupt
+/// packet with TEI clear; without this check that corrupt symbol would silently
+/// poison a whole decoded block. A failed CRC turns the frame into an erasure,
+/// which RaptorQ is designed to recover.
+pub const CRC_SIZE: usize = 4;
+pub const SYMBOL_SIZE: usize = TS_PAYLOAD_SIZE - FRAME_OVERHEAD - CRC_SIZE;
+
+/// Offset within the TS payload of the 4-byte CRC trailer. Everything before it
+/// (frame type, OTI, payload id, symbol) is covered by the CRC.
+pub const FRAME_CRC_OFFSET: usize = FRAME_SYMBOL_OFFSET + SYMBOL_SIZE;
 
 pub const FRAME_TYPE_DATA: u8 = 0x01;
 pub const FRAME_TYPE_NOOP: u8 = 0x02;
@@ -33,8 +48,42 @@ pub enum ParseError {
     TransportError,
     #[error("PID {got:#x} does not match expected {want:#x}")]
     WrongPid { got: u16, want: u16 },
+    #[error("frame CRC mismatch (corrupt frame)")]
+    BadCrc,
     #[error("unknown frame type {0:#x}")]
     UnknownFrameType(u8),
+}
+
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+static CRC32_TABLE: [u32; 256] = crc32_table();
+
+/// Standard CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) — the same value as
+/// zlib/PNG. Used as the per-frame integrity trailer.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize];
+    }
+    crc ^ 0xFFFF_FFFF
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +167,15 @@ pub fn build_data_packet(
     debug_assert_eq!(sym.len(), SYMBOL_SIZE);
     out[TS_HEADER_SIZE + FRAME_SYMBOL_OFFSET..TS_HEADER_SIZE + FRAME_SYMBOL_OFFSET + SYMBOL_SIZE]
         .copy_from_slice(sym);
+
+    write_frame_crc(out);
+}
+
+/// Compute the CRC-32 over the frame body and write it into the trailer. Covers
+/// everything in the TS payload up to (but not including) the CRC field.
+fn write_frame_crc(out: &mut [u8; TS_PACKET_SIZE]) {
+    let crc = crc32(&out[TS_HEADER_SIZE..TS_HEADER_SIZE + FRAME_CRC_OFFSET]);
+    out[TS_HEADER_SIZE + FRAME_CRC_OFFSET..].copy_from_slice(&crc.to_be_bytes());
 }
 
 /// Build a 188-byte noop stuffing packet.
@@ -135,9 +193,10 @@ pub fn build_noop_packet(pid: u16, cc: u8, out: &mut [u8; TS_PACKET_SIZE]) {
     .write(&mut hdr);
     out[..TS_HEADER_SIZE].copy_from_slice(&hdr);
     out[TS_HEADER_SIZE] = FRAME_TYPE_NOOP;
-    for b in &mut out[TS_HEADER_SIZE + 1..] {
+    for b in &mut out[TS_HEADER_SIZE + 1..TS_HEADER_SIZE + FRAME_CRC_OFFSET] {
         *b = 0xFF;
     }
+    write_frame_crc(out);
 }
 
 #[derive(Debug)]
@@ -172,6 +231,17 @@ pub fn parse_packet(bytes: &[u8], expected_pid: u16) -> Result<ParsedFrame, Pars
         });
     }
     let payload = &bytes[TS_HEADER_SIZE..];
+    // Integrity gate before trusting any frame field. A corrupt-but-parseable
+    // frame (DVB-S RS miscorrection, byte-stream resync aliasing) is rejected
+    // here so RaptorQ never ingests a poisoned symbol or a garbage OTI.
+    let stored_crc = u32::from_be_bytes(
+        payload[FRAME_CRC_OFFSET..FRAME_CRC_OFFSET + CRC_SIZE]
+            .try_into()
+            .unwrap(),
+    );
+    if crc32(&payload[..FRAME_CRC_OFFSET]) != stored_crc {
+        return Err(ParseError::BadCrc);
+    }
     let frame_type = payload[FRAME_TYPE_OFFSET];
     match frame_type {
         FRAME_TYPE_NOOP => Ok(ParsedFrame::Noop {
@@ -202,6 +272,22 @@ pub fn make_block_oti(block_size: u64, symbol_size: u16) -> ObjectTransmissionIn
     ObjectTransmissionInformation::new(block_size, symbol_size, 1, 1, 1)
 }
 
+/// Force raptorq to build its lazy RFC-6330 systematic-constant tables for the
+/// given block geometry by running a throwaway encode→decode roundtrip. The
+/// first `SourceBlockEncoder::new`/`SourceBlockDecoder` for a value of K costs
+/// ~300ms while these (process-global) tables are computed; calling this at
+/// startup moves that one-time stall off the live stream instead of glitching
+/// the first block. Cheap once the tables for this K already exist.
+pub fn warm_raptorq(block_size: u64, symbol_size: u16) {
+    let oti = make_block_oti(block_size, symbol_size);
+    let block = vec![0u8; block_size as usize];
+    let enc = SourceBlockEncoder::new(0, &oti, &block);
+    let mut packets = enc.source_packets();
+    packets.extend(enc.repair_packets(0, 1));
+    let mut dec = SourceBlockDecoder::new(0, &oti, block_size);
+    let _ = dec.decode(packets);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,8 +295,59 @@ mod tests {
 
     #[test]
     fn frame_sizes_fit_ts_packet() {
-        assert_eq!(FRAME_OVERHEAD + SYMBOL_SIZE, TS_PAYLOAD_SIZE);
+        assert_eq!(FRAME_OVERHEAD + SYMBOL_SIZE + CRC_SIZE, TS_PAYLOAD_SIZE);
+        assert_eq!(FRAME_CRC_OFFSET + CRC_SIZE, TS_PAYLOAD_SIZE);
         assert_eq!(TS_HEADER_SIZE + TS_PAYLOAD_SIZE, TS_PACKET_SIZE);
+    }
+
+    #[test]
+    fn crc32_matches_known_vector() {
+        // "123456789" -> 0xCBF43926 is the standard CRC-32 check value.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn warm_raptorq_runs() {
+        // Just exercises the roundtrip path; must not panic for the default geometry.
+        warm_raptorq(DEFAULT_BLOCK_SIZE as u64, SYMBOL_SIZE as u16);
+    }
+
+    #[test]
+    fn crc_rejects_symbol_bit_flip() {
+        let block: Vec<u8> = (0..DEFAULT_BLOCK_SIZE).map(|i| (i & 0xFF) as u8).collect();
+        let oti = make_block_oti(block.len() as u64, SYMBOL_SIZE as u16);
+        let enc = SourceBlockEncoder::new(7, &oti, &block);
+        let src = enc.source_packets();
+        let mut buf = [0u8; TS_PACKET_SIZE];
+        build_data_packet(0x100, 5, &oti, &src[0], &mut buf);
+
+        // Flip one bit in the symbol region; CRC must catch it.
+        buf[TS_HEADER_SIZE + FRAME_SYMBOL_OFFSET] ^= 0x01;
+        assert!(matches!(parse_packet(&buf, 0x100), Err(ParseError::BadCrc)));
+    }
+
+    #[test]
+    fn crc_rejects_oti_corruption() {
+        // A corrupt OTI is exactly what panicked the decoder; the CRC rejects it
+        // at the frame boundary, before any SourceBlockDecoder is constructed.
+        let block: Vec<u8> = (0..DEFAULT_BLOCK_SIZE).map(|i| (i & 0xFF) as u8).collect();
+        let oti = make_block_oti(block.len() as u64, SYMBOL_SIZE as u16);
+        let enc = SourceBlockEncoder::new(1, &oti, &block);
+        let mut buf = [0u8; TS_PACKET_SIZE];
+        build_data_packet(0x100, 0, &oti, &enc.source_packets()[0], &mut buf);
+
+        buf[TS_HEADER_SIZE + FRAME_OTI_OFFSET] ^= 0xFF;
+        assert!(matches!(parse_packet(&buf, 0x100), Err(ParseError::BadCrc)));
+    }
+
+    #[test]
+    fn crc_passes_for_clean_noop() {
+        let mut buf = [0u8; TS_PACKET_SIZE];
+        build_noop_packet(0x100, 1, &mut buf);
+        assert!(matches!(parse_packet(&buf, 0x100), Ok(ParsedFrame::Noop { .. })));
+        // Corrupt the noop stuffing -> rejected.
+        buf[TS_HEADER_SIZE + 1] ^= 0xFF;
+        assert!(matches!(parse_packet(&buf, 0x100), Err(ParseError::BadCrc)));
     }
 
     #[test]

@@ -135,6 +135,12 @@ fn main() -> Result<()> {
 
     let oti = make_block_oti(args.block_size as u64, SYMBOL_SIZE as u16);
 
+    // Pay raptorq's ~300ms first-block table-build cost now, before the paced
+    // writer starts, so the live stream doesn't stall on its first block.
+    let warm = Instant::now();
+    raptorq_ts_common::warm_raptorq(args.block_size as u64, SYMBOL_SIZE as u16);
+    debug!(elapsed_ms = warm.elapsed().as_millis() as u64, "raptorq tables warmed");
+
     let sink = match args.output {
         OutputMode::Stdout => Sink::Stdout,
         OutputMode::Zmq => {

@@ -21,3 +21,10 @@ zmq = "0.10"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# raptorq is matrix-heavy; unoptimized it is ~100x slower, which starves the
+# real-time-paced e2e subprocess tests (they spawn debug binaries) of CPU so
+# they emit no data within their timing windows. Optimize just the dependency,
+# keeping our own crates debuggable and quick to compile.
+[profile.dev.package.raptorq]
+opt-level = 3
