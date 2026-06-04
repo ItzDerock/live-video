@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use raptorq_ts_common::{
-    DEFAULT_BLOCK_SIZE, FRAME_TYPE_DATA, FRAME_TYPE_NOOP, FRAME_TYPE_OFFSET, SYMBOL_SIZE, TS_HEADER_SIZE,
+    DEFAULT_BLOCK_SIZE, FRAME_TYPE_DATA, FRAME_TYPE_NOOP, FRAME_TYPE_OFFSET, TS_HEADER_SIZE,
     TS_PACKET_SIZE,
 };
 
@@ -56,27 +56,6 @@ fn fake_ts_stream(num_packets: usize, seed: u64) -> Vec<u8> {
     buf
 }
 
-/// Forward 188-byte packets from `reader` to `writer` until the reader hits EOF
-/// (the encoder closed its stdout) or the writer goes away. Only packets for
-/// which `keep(index)` returns true are written, modelling link loss. `writer`
-/// is moved in and dropped on return, closing the decoder's stdin.
-fn forward<R: Read, W: Write>(mut reader: R, mut writer: W, mut keep: impl FnMut(usize) -> bool) {
-    let mut buf = [0u8; TS_PACKET_SIZE];
-    let mut idx = 0usize;
-    loop {
-        match reader.read_exact(&mut buf) {
-            Ok(()) => {
-                if keep(idx) && writer.write_all(&buf).is_err() {
-                    break;
-                }
-                idx += 1;
-            }
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-            Err(_) => break,
-        }
-    }
-}
-
 #[test]
 fn enc_dec_loopback_clean() {
     let (enc, dec) = bins();
@@ -104,7 +83,7 @@ fn enc_dec_loopback_clean() {
 
     let mut enc_stdin = enc_proc.stdin.take().unwrap();
     let enc_stdout = enc_proc.stdout.take().unwrap();
-    let dec_stdin = dec_proc.stdin.take().unwrap();
+    let mut dec_stdin = dec_proc.stdin.take().unwrap();
     let mut dec_stdout = dec_proc.stdout.take().unwrap();
 
     let writer_input = input.clone();
@@ -113,12 +92,26 @@ fn enc_dec_loopback_clean() {
         drop(enc_stdin);
     });
 
-    // Pipe enc -> dec, dropping nothing. Forward the encoder's entire output
-    // (until it closes stdout) rather than a fixed packet count: raptorq's
-    // ~300ms first-block table build means real data can trail a long run of
-    // startup noops, which a small cap would miss.
+    // Pipe enc -> dec, dropping nothing.
     let pipe_thread = thread::spawn(move || {
-        forward(enc_stdout, dec_stdin, |_| true);
+        let mut reader = enc_stdout;
+        let mut buf = [0u8; TS_PACKET_SIZE];
+        let mut forwarded = 0usize;
+        let limit = blocks * (DEFAULT_BLOCK_SIZE / 167) * 2 + 100;
+        loop {
+            match reader.read_exact(&mut buf) {
+                Ok(()) => {
+                    dec_stdin.write_all(&buf).unwrap();
+                    forwarded += 1;
+                    if forwarded > limit {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("read error: {e}"),
+            }
+        }
+        drop(dec_stdin);
     });
 
     let mut out = Vec::new();
@@ -127,14 +120,15 @@ fn enc_dec_loopback_clean() {
         out
     });
 
-    // Both children exit on their own: enc drains and exits when its stdin
-    // closes, dec flushes and exits when the pipe closes its stdin. Wait for
-    // that instead of racing a fixed sleep against the warm-up.
     in_thread.join().unwrap();
     pipe_thread.join().unwrap();
-    let out = reader_thread.join().unwrap();
+    let _ = enc_proc.kill();
     let _ = enc_proc.wait();
+    // Give dec a moment to flush, then close.
+    thread::sleep(Duration::from_millis(300));
+    let _ = dec_proc.kill();
     let _ = dec_proc.wait();
+    let out = reader_thread.join().unwrap();
 
     assert!(
         out.len() >= input.len(),
@@ -168,46 +162,30 @@ fn enc_emits_noops_under_underrun() {
     // Keep the stdin write-end alive in the parent so the child sees an open empty pipe.
     let _stdin_keep_open = proc.stdin.take().unwrap();
 
-    // Sample 200 ms of output. At 1.46 Mbps that's ~190 packets. raptorq's
-    // ~300ms first-block table build emits nothing, so start the clock on the
-    // first byte and measure throughput over the window after it.
+    // Sample 200 ms of output. At 1.46 Mbps that's ~190 packets.
     let measurement = Duration::from_millis(200);
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, f64)>();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let reader = thread::spawn(move || {
         let mut all = Vec::with_capacity(64 * 1024);
         let mut buf = [0u8; 4096];
-        let first = loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => {
-                    tx.send((all, 0.0)).unwrap();
-                    return;
-                }
-                Ok(n) => {
-                    all.extend_from_slice(&buf[..n]);
-                    break std::time::Instant::now();
-                }
-                Err(_) => {
-                    tx.send((all, 0.0)).unwrap();
-                    return;
-                }
-            }
-        };
-        while first.elapsed() < measurement {
+        let start = std::time::Instant::now();
+        while start.elapsed() < measurement + Duration::from_millis(50) {
             match stdout.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => all.extend_from_slice(&buf[..n]),
                 Err(_) => break,
             }
         }
-        tx.send((all, first.elapsed().as_secs_f64())).unwrap();
+        tx.send(all).unwrap();
     });
 
-    let (got, secs) = rx.recv().unwrap();
+    thread::sleep(measurement + Duration::from_millis(200));
     let _ = proc.kill();
     let _ = proc.wait();
     reader.join().unwrap();
+    let got = rx.recv().unwrap();
 
-    let bytes_per_sec = (got.len() as f64) / secs;
+    let bytes_per_sec = (got.len() as f64) / (measurement.as_secs_f64() + 0.05);
     let expected_bps = rate_bps as f64;
     let ratio = bytes_per_sec * 8.0 / expected_bps;
     assert!(
@@ -248,7 +226,7 @@ fn enc_dec_loopback_with_random_drops() {
 
     let mut enc_stdin = enc_proc.stdin.take().unwrap();
     let enc_stdout = enc_proc.stdout.take().unwrap();
-    let dec_stdin = dec_proc.stdin.take().unwrap();
+    let mut dec_stdin = dec_proc.stdin.take().unwrap();
     let mut dec_stdout = dec_proc.stdout.take().unwrap();
 
     let writer_input = input.clone();
@@ -257,14 +235,31 @@ fn enc_dec_loopback_with_random_drops() {
         drop(enc_stdin);
     });
 
-    // Drop ~10% of TS packets randomly; within the 25% repair budget. Forward to
-    // EOF (see enc_dec_loopback_clean) so the post-warm-up data is not missed.
+    // Drop ~10% of TS packets randomly; within 25% repair budget.
     let pipe_thread = thread::spawn(move || {
+        let mut reader = enc_stdout;
+        let mut buf = [0u8; TS_PACKET_SIZE];
+        let mut idx = 0usize;
         let mut rng = 0xdeadbeefu64;
-        forward(enc_stdout, dec_stdin, move |_| {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            (rng >> 40) % 100 >= 10
-        });
+        let limit = blocks * (DEFAULT_BLOCK_SIZE / 167) * 2 + 200;
+        loop {
+            match reader.read_exact(&mut buf) {
+                Ok(()) => {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let drop = (rng >> 40) % 100 < 10;
+                    if !drop {
+                        dec_stdin.write_all(&buf).unwrap();
+                    }
+                    idx += 1;
+                    if idx > limit {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(_) => break,
+            }
+        }
+        drop(dec_stdin);
     });
 
     let reader_thread = thread::spawn(move || {
@@ -275,9 +270,12 @@ fn enc_dec_loopback_with_random_drops() {
 
     in_thread.join().unwrap();
     pipe_thread.join().unwrap();
-    let out = reader_thread.join().unwrap();
+    let _ = enc_proc.kill();
     let _ = enc_proc.wait();
+    thread::sleep(Duration::from_millis(500));
+    let _ = dec_proc.kill();
     let _ = dec_proc.wait();
+    let out = reader_thread.join().unwrap();
 
     assert!(
         out.len() >= input.len(),
@@ -319,29 +317,21 @@ fn count_frames(enc: &Path, adaptive: bool, input: &[u8]) -> (usize, usize) {
     let owned = input.to_vec();
     let writer = thread::spawn(move || {
         stdin.write_all(&owned).ok();
-        // Keep stdin open past the raptorq warm-up so there is genuine idle
-        // airtime to sample after output starts.
-        thread::sleep(Duration::from_millis(900));
+        // Keep stdin open: the encoder waits for the next block and the writer
+        // has idle airtime to fill.
+        thread::sleep(Duration::from_millis(500));
         drop(stdin);
     });
 
-    // raptorq's ~300ms first-block table build emits nothing; start the sampling
-    // window on the first byte so it measures the steady state, not the warm-up.
     let window = Duration::from_millis(250);
     let reader = thread::spawn(move || {
         let mut all = Vec::new();
         let mut buf = [0u8; 8192];
-        let mut started: Option<std::time::Instant> = None;
-        loop {
-            if started.map_or(false, |t| t.elapsed() >= window) {
-                break;
-            }
+        let start = std::time::Instant::now();
+        while start.elapsed() < window {
             match stdout.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => {
-                    all.extend_from_slice(&buf[..n]);
-                    started.get_or_insert_with(std::time::Instant::now);
-                }
+                Ok(n) => all.extend_from_slice(&buf[..n]),
                 Err(_) => break,
             }
         }
@@ -373,7 +363,7 @@ fn adaptive_fec_fills_idle_with_repair_not_noops() {
     let ts_packets = DEFAULT_BLOCK_SIZE / TS_PACKET_SIZE + 1;
     let input = fake_ts_stream(ts_packets, 7);
     // One block = K source + 25% baseline repair.
-    let baseline_data = DEFAULT_BLOCK_SIZE / SYMBOL_SIZE + (DEFAULT_BLOCK_SIZE / SYMBOL_SIZE) / 4;
+    let baseline_data = DEFAULT_BLOCK_SIZE / 167 + (DEFAULT_BLOCK_SIZE / 167) / 4;
 
     let (adaptive_data, adaptive_noop) = count_frames(&enc, true, &input);
     let (plain_data, plain_noop) = count_frames(&enc, false, &input);
