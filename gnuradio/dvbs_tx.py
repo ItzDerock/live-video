@@ -38,7 +38,7 @@ class dvbs_tx(gr.top_block):
         self.symbol_rate = symbol_rate = 2600000
         self.samp_rate = samp_rate = symbol_rate * 2
         self.rrc_taps = rrc_taps = 100
-        self.center_freq = center_freq = int(2394e6)
+        self.center_freq = center_freq = int(3403e6)
 
         ##################################################
         # Blocks

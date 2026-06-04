@@ -1,3 +1,4 @@
 .direnv/
 ansible/.ansible
 ansible/inventory.ini
+out/*.ts
