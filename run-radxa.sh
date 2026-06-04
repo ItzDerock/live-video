@@ -33,6 +33,7 @@ MINRATE_BPS="${MINRATE_BPS:-0}"         # -minrate floor (bits/s); keep 0/low so
 BUFSIZE_BITS="${BUFSIZE_BITS:-2300000}" # -bufsize VBV window (bits); smaller = tighter per-burst/I-frame cap
 GOP="${GOP:-60}"                        # keyframes every 2 s (GOP / FPS)
 BFRAMES="${BFRAMES:-0}"                 # -bf      B-frames; 0 for low latency
+REPEAT_HEADERS="${REPEAT_HEADERS:-1}"   # 1: re-send VPS/SPS/PPS before every keyframe so the RX can join mid-stream
 MUX_BITRATE="${MUX_BITRATE:-2900000}"   # only used by the CBR-TS fallback (see bottom comment)
 
 ### OUTPUT configuration
@@ -108,6 +109,13 @@ FILTERGRAPH="[1:v]format=bgra,hwupload[ovl];[0:v][ovl]overlay_rkrga=x=10:y=10:eo
 RC_ARGS=( -rc_mode "$RC_MODE" -b:v "$TARGET_BPS" -maxrate "$MAXRATE_BPS" -bufsize "$BUFSIZE_BITS" )
 (( MINRATE_BPS > 0 )) && RC_ARGS+=( -minrate "$MINRATE_BPS" )
 
+# Re-emit parameter sets before each keyframe. The rkmpp encoder writes
+# VPS/SPS/PPS once at startup; an RX that tunes in afterwards never sees them and
+# its decoder stalls (ffplay sinks bytes forever). dump_extra is encoder-agnostic
+# and skips packets that already start with the headers, so it's safe to leave on.
+HDR_BSF=()
+(( REPEAT_HEADERS )) && HDR_BSF=( -bsf:v dump_extra=freq=keyframe )
+
 FFMPEG_CMD=(
   "$FFMPEG" -hide_banner -loglevel warning -stats
   # Shared rkmpp hw device so input-1's hwupload lands in the SAME context
@@ -128,7 +136,7 @@ FFMPEG_CMD=(
   # NOTE: no -color_range here — on the HW path it forces a software range
   # conversion (swscale) that can't touch drm_prime and trips auto_scale.
   # Handle range inside RGA if needed; otherwise tag/convert on the RX side.
-  -c:v hevc_rkmpp "${RC_ARGS[@]}" -g "$GOP" -bf "$BFRAMES"
+  -c:v hevc_rkmpp "${RC_ARGS[@]}" -g "$GOP" -bf "$BFRAMES" "${HDR_BSF[@]}"
   # VBR transport stream — raptorq paces the channel, so no -muxrate here
   -f mpegts -flush_packets 1
   pipe:1
